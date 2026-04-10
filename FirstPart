@@ -1,0 +1,496 @@
+import requests
+import numpy as np
+import pandas as pd
+import time
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy import stats
+import csv
+import warnings
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────
+#  CONFIGURATION  (hard-coded as required)
+# ─────────────────────────────────────────────
+START_DATE  = '2022-01-01'
+END_DATE    = '2024-12-31'
+TICKERS     = ['AAPL', 'MSFT', 'JPM']   # three stocks
+INDEX       = 'SPY'                       # benchmark
+API_KEY     = 'ZKMMTO1ATDBLXH2K'
+RISK_FREE   = 0.045                       # approx annual risk-free rate (2022-2024 avg)
+
+# Walk-forward parameters
+TRAIN_MONTHS = 12
+TEST_MONTHS  = 3
+
+# ─────────────────────────────────────────────
+#  1. DATA DOWNLOAD + RETURNS + CSV EXPORT
+# ─────────────────────────────────────────────
+
+def get_daily_data(startd, endd, ticker):
+    """Download daily adjusted close prices from AlphaVantage."""
+    info = []
+    key         = '&apikey=' + API_KEY
+    ticker_param= '&symbol=' + str(ticker)
+    endpoint    = 'function=TIME_SERIES_DAILY_ADJUSTED'
+    size        = '&outputsize=full'
+    web         = 'https://www.alphavantage.co/query?'
+    url         = web + endpoint + ticker_param + size + key
+
+    r = requests.get(url)
+    if r.status_code == 200:
+        print(f'  [{ticker}] Connection successful')
+        data = r.json()
+        r1   = data.get('Time Series (Daily)', {})
+        for date, values in sorted(r1.items()):
+            if startd <= date <= endd:
+                info.append([date, ticker, float(values['5. adjusted close'])])
+    else:
+        print(f'  [{ticker}] Request failed: {r.status_code}')
+    return info
+
+
+def download_and_prepare(tickers, index, startd, endd, csv_path='trading_data.csv'):
+    """
+    Download all tickers + index, compute log-returns,
+    and export to CSV.  Returns a wide DataFrame indexed by date.
+    """
+    all_tickers = tickers + [index]
+    raw = {}
+
+    for t in all_tickers:
+        rows = get_daily_data(startd, endd, t)
+        if rows:
+            df_t = pd.DataFrame(rows, columns=['date', 'ticker', 'close'])
+            df_t.set_index('date', inplace=True)
+            raw[t] = df_t['close']
+        time.sleep(12)          # AlphaVantage free tier: 5 calls/min
+
+    prices = pd.DataFrame(raw).sort_index()
+    prices.index = pd.to_datetime(prices.index)
+
+    log_returns = np.log(prices / prices.shift(1))
+
+    # ── CSV export (date + ticker columns preserved for tractability) ──
+    export_rows = []
+    for date in prices.index:
+        for t in all_tickers:
+            if t in prices.columns and not pd.isna(prices.loc[date, t]):
+                export_rows.append({
+                    'date'      : date.strftime('%Y-%m-%d'),
+                    'ticker'    : t,
+                    'close'     : round(prices.loc[date, t], 4),
+                    'log_return': round(log_returns.loc[date, t], 6)
+                                  if not pd.isna(log_returns.loc[date, t]) else ''
+                })
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['date','ticker','close','log_return'])
+        writer.writeheader()
+        writer.writerows(export_rows)
+    print(f'\nData exported to {csv_path}')
+
+    return prices, log_returns
+
+
+# ─────────────────────────────────────────────
+#  2. INDICATOR FUNCTIONS  (return 1, 0, or -1)
+# ─────────────────────────────────────────────
+
+def indicator_macd(prices_series, date_idx, fast=12, slow=26, signal=9):
+    """
+    MACD crossover indicator.
+    Returns  1 (MACD crosses above signal line) | -1 (crosses below) | 0 (no cross)
+    """
+    loc = prices_series.index.get_loc(date_idx)
+    if loc < slow + signal:
+        return 0
+    hist        = prices_series.iloc[:loc + 1]
+    ema_fast    = hist.ewm(span=fast,   adjust=False).mean()
+    ema_slow    = hist.ewm(span=slow,   adjust=False).mean()
+    macd_line   = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    if macd_line.iloc[-1] > signal_line.iloc[-1] and macd_line.iloc[-2] <= signal_line.iloc[-2]:
+        return 1
+    elif macd_line.iloc[-1] < signal_line.iloc[-1] and macd_line.iloc[-2] >= signal_line.iloc[-2]:
+        return -1
+    return 0
+
+
+def indicator_fibonacci(prices_series, date_idx, window=30):
+    """
+    Fibonacci Retracement indicator.
+    Computes key fib levels (23.6%, 38.2%, 61.8%) over a rolling window.
+    - Price near/below 61.8% retracement (closer to swing low) → buy signal (1)
+    - Price near/above 23.6% retracement (closer to swing high) → sell signal (-1)
+    - Price between levels → hold (0)
+    """
+    loc = prices_series.index.get_loc(date_idx)
+    if loc < window:
+        return 0
+    window_prices = prices_series.iloc[loc - window: loc + 1]
+    high  = window_prices.max()
+    low   = window_prices.min()
+    rang  = high - low
+    if rang == 0:
+        return 0
+
+    price   = prices_series.iloc[loc]
+    fib_236 = high - 0.236 * rang   # near top
+    fib_382 = high - 0.382 * rang
+    fib_618 = high - 0.618 * rang   # near bottom
+
+    if price <= fib_618:
+        return 1    # price at or below 61.8% → oversold, buy
+    elif price >= fib_236:
+        return -1   # price at or above 23.6% → overbought, sell
+    return 0
+
+
+def indicator_permutation_entropy(prices_series, date_idx, window=20, order=3):
+    """
+    Permutation Entropy (PE) indicator.
+    Measures the complexity/randomness of the price series over a rolling window.
+    Low PE  → price is more orderly/predictable → follow MACD trend direction (1 or -1)
+    High PE → price is noisy/random → stay out (0)
+
+    order=3 means we look at patterns of 3 consecutive prices (3! = 6 possible permutations).
+    Threshold: PE < 0.70 of max entropy → signal active; >= 0.85 → too noisy.
+    """
+    from itertools import permutations as iperms
+
+    loc = prices_series.index.get_loc(date_idx)
+    if loc < window + order:
+        return 0
+
+    window_prices = prices_series.iloc[loc - window: loc + 1].values
+    n_perms       = len(window_prices) - order + 1
+    max_entropy   = np.log2(__import__("math").factorial(order))  # log2(order!)
+
+    # Count frequency of each ordinal pattern
+    counts = {}
+    for i in range(n_perms):
+        pattern = tuple(np.argsort(window_prices[i: i + order]))
+        counts[pattern] = counts.get(pattern, 0) + 1
+
+    # Shannon entropy of the pattern distribution
+    probs = np.array(list(counts.values())) / n_perms
+    pe    = -np.sum(probs * np.log2(probs + 1e-12)) / max_entropy  # normalised [0,1]
+
+    # Low entropy: market is predictable — use MACD direction to decide long/short
+    if pe < 0.70:
+        macd_sig = indicator_macd(prices_series, date_idx)
+        return macd_sig if macd_sig != 0 else 1   # default long if MACD flat
+    return 0   # high entropy → no signal
+
+
+
+def indicator_momentum(prices_series, date_idx, window=20):
+    """
+    Price momentum indicator (20-day).
+    Returns  1 (positive momentum > 2%) | -1 (negative < -2%) | 0 (flat)
+    """
+    loc = prices_series.index.get_loc(date_idx)
+    if loc < window:
+        return 0
+    ret = (prices_series.iloc[loc] / prices_series.iloc[loc - window]) - 1
+    if ret > 0.02:
+        return 1
+    elif ret < -0.02:
+        return -1
+    return 0
+
+
+# ─────────────────────────────────────────────
+#  3. RECOMMENDATION FUNCTION
+# ─────────────────────────────────────────────
+
+def get_recommendation(macd_sig, fib_sig, pe_sig, mom_sig):
+    """
+    Combine four indicators into a 5-level recommendation:
+      strong_buy | buy | hold | sell | strong_sell
+    Score: sum of signals (each in {-1, 0, 1}), max = 4, min = -4
+    """
+    score = macd_sig + fib_sig + pe_sig + mom_sig
+    if score >= 3:
+        return 'strong_buy'
+    elif score == 2:
+        return 'buy'
+    elif score == -2:
+        return 'sell'
+    elif score <= -3:
+        return 'strong_sell'
+    else:
+        return 'hold'
+
+
+# ─────────────────────────────────────────────
+#  4. TRADE EXECUTION + LOG-RETURN
+# ─────────────────────────────────────────────
+
+def execute_trade(recommendation, log_return_next_day):
+    """
+    Given recommendation and next-day log-return, return the realised
+    log-return of the trade (None if no trade).
+    Long  for buy / strong_buy  → take the return as-is
+    Short for sell / strong_sell → negate the return
+    Hold  → no trade
+    """
+    if recommendation in ('buy', 'strong_buy'):
+        return log_return_next_day, 'long'
+    elif recommendation in ('sell', 'strong_sell'):
+        return -log_return_next_day, 'short'
+    return None, None
+
+
+def run_strategy(prices, log_returns, ticker, start=None, end=None):
+    """
+    Run the full strategy for a single ticker over [start, end].
+    Returns a DataFrame with date, recommendation, direction, and log-return.
+    """
+    ps = prices[ticker].dropna()
+    lr = log_returns[ticker].dropna()
+
+    if start:
+        ps = ps[ps.index >= pd.Timestamp(start)]
+        lr = lr[lr.index >= pd.Timestamp(start)]
+    if end:
+        ps = ps[ps.index <= pd.Timestamp(end)]
+        lr = lr[lr.index <= pd.Timestamp(end)]
+
+    results = []
+    dates   = ps.index
+
+    for i in range(len(dates) - 1):           # -1: need next-day return
+        d = dates[i]
+        macd_s = indicator_macd(ps, d)
+        fib_s  = indicator_fibonacci(ps, d)
+        pe_s   = indicator_permutation_entropy(ps, d)
+        mom_s  = indicator_momentum(ps, d)
+        rec    = get_recommendation(macd_s, fib_s, pe_s, mom_s)
+
+        next_d = dates[i + 1]
+        if next_d not in lr.index:
+            continue
+        trade_ret, direction = execute_trade(rec, lr.loc[next_d])
+
+        if trade_ret is not None:
+            results.append({
+                'date'      : d,
+                'ticker'    : ticker,
+                'rec'       : rec,
+                'direction' : direction,
+                'log_return': trade_ret
+            })
+
+    return pd.DataFrame(results)
+
+
+# ─────────────────────────────────────────────
+#  5. PERFORMANCE ANALYTICS
+# ─────────────────────────────────────────────
+
+def compute_performance(trade_df, market_log_returns, label='Strategy'):
+    """
+    Compute and print all required performance metrics (items a–i).
+    trade_df must have columns: date, direction, log_return
+    market_log_returns: pd.Series of market (SPY) log-returns indexed by date
+    """
+    if trade_df.empty:
+        print(f'\n[{label}] No trades found.')
+        return {}
+
+    df = trade_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date').sort_index()
+
+    ret = df['log_return'].values
+    n   = len(ret)
+
+    # ── a. Trades per month ──
+    df['ym'] = df.index.to_period('M')
+    trades_per_month = df.groupby('ym').size()
+    avg_trades_month = trades_per_month.mean()
+
+    # ── b. Average return + t-test ──
+    avg_ret  = ret.mean()
+    t_stat, p_val = stats.ttest_1samp(ret, 0)
+
+    # ── c. Average return longs ──
+    longs  = df[df['direction'] == 'long']['log_return']
+    avg_long = longs.mean() if len(longs) > 0 else np.nan
+
+    # ── d. Average return shorts ──
+    shorts = df[df['direction'] == 'short']['log_return']
+    avg_short = shorts.mean() if len(shorts) > 0 else np.nan
+
+    # ── e. Cumulative return, annualized ──
+    cum_return     = np.exp(ret.sum()) - 1
+    n_days         = (df.index[-1] - df.index[0]).days
+    years          = n_days / 365.25 if n_days > 0 else 1
+    ann_cum_return = (1 + cum_return) ** (1 / years) - 1
+
+    # ── f. Sharpe Ratio (annualized) ──
+    daily_rf  = RISK_FREE / 252
+    excess    = ret - daily_rf
+    sharpe    = (excess.mean() / ret.std()) * np.sqrt(252) if ret.std() > 0 else np.nan
+
+    # ── g. Sortino Ratio (annualized) ──
+    downside  = ret[ret < 0]
+    down_std  = downside.std() if len(downside) > 1 else np.nan
+    sortino   = ((avg_ret - daily_rf) / down_std) * np.sqrt(252) if down_std and down_std > 0 else np.nan
+
+    # ── h. Jensen's Alpha ──
+    # align market returns to trade dates only
+    trade_dates   = df.index
+    mkt_on_trades = market_log_returns.reindex(trade_dates).dropna()
+    strat_aligned = df['log_return'].reindex(mkt_on_trades.index).dropna()
+    mkt_on_trades = mkt_on_trades.reindex(strat_aligned.index).dropna()
+
+    if len(mkt_on_trades) > 2:
+        cov_matrix = np.cov(strat_aligned, mkt_on_trades)
+        beta       = cov_matrix[0, 1] / cov_matrix[1, 1]
+        alpha_daily= avg_ret - (daily_rf + beta * (mkt_on_trades.mean() - daily_rf))
+        jensens_alpha = alpha_daily * 252          # annualized
+    else:
+        beta, jensens_alpha = np.nan, np.nan
+
+    # ── i. VaR at 5% ──
+    var_5 = np.percentile(ret, 5)
+
+    # ── Print ──
+    print(f'\n{"="*55}')
+    print(f'  PERFORMANCE REPORT: {label}')
+    print(f'{"="*55}')
+    print(f'  a. Avg trades / month       : {avg_trades_month:.2f}')
+    print(f'  b. Avg log-return / trade   : {avg_ret:.5f}')
+    print(f'     t-stat                   : {t_stat:.3f}')
+    print(f'     p-value                  : {p_val:.4f}  {"*** significant" if p_val < 0.05 else "(not significant)"}')
+    print(f'  c. Avg return (longs)       : {avg_long:.5f}' if not np.isnan(avg_long) else '  c. No long trades')
+    print(f'  d. Avg return (shorts)      : {avg_short:.5f}' if not np.isnan(avg_short) else '  d. No short trades')
+    print(f'  e. Cumulative return        : {cum_return*100:.2f}%')
+    print(f'     Annualized               : {ann_cum_return*100:.2f}%')
+    print(f'  f. Sharpe Ratio (ann.)      : {sharpe:.3f}')
+    print(f'  g. Sortino Ratio (ann.)     : {sortino:.3f}')
+    print(f'  h. Jensen\'s Alpha (ann.)    : {jensens_alpha:.5f}' if not np.isnan(jensens_alpha) else '  h. Jensen\'s Alpha: N/A')
+    print(f'     Beta                     : {beta:.3f}' if not np.isnan(beta) else '')
+    print(f'  i. VaR (5%)                 : {var_5:.5f}')
+    print(f'{"="*55}\n')
+
+    return {
+        'n_trades': n, 'avg_trades_month': avg_trades_month,
+        'avg_ret': avg_ret, 't_stat': t_stat, 'p_val': p_val,
+        'avg_long': avg_long, 'avg_short': avg_short,
+        'cum_return': cum_return, 'ann_cum_return': ann_cum_return,
+        'sharpe': sharpe, 'sortino': sortino,
+        'jensens_alpha': jensens_alpha, 'beta': beta, 'var_5': var_5
+    }
+
+
+# ─────────────────────────────────────────────
+#  6. WALK-FORWARD BACKTEST
+# ─────────────────────────────────────────────
+
+def walk_forward_backtest(prices, log_returns, ticker, index,
+                          train_months=TRAIN_MONTHS, test_months=TEST_MONTHS):
+    """
+    Walk-forward validation:
+    Slide a training window of `train_months`, test on next `test_months`.
+    Collect all out-of-sample trades and report aggregate performance.
+    """
+    all_trades = []
+    start_dt   = prices.index.min()
+    end_dt     = prices.index.max()
+
+    window_start = start_dt
+    fold = 1
+
+    while True:
+        train_end = window_start + pd.DateOffset(months=train_months)
+        test_end  = train_end   + pd.DateOffset(months=test_months)
+        if test_end > end_dt:
+            break
+
+        print(f'  Fold {fold}: train [{window_start.date()} → {train_end.date()}]  '
+              f'test [{train_end.date()} → {test_end.date()}]')
+
+        test_trades = run_strategy(prices, log_returns, ticker,
+                                   start=train_end.strftime('%Y-%m-%d'),
+                                   end=test_end.strftime('%Y-%m-%d'))
+        all_trades.append(test_trades)
+
+        window_start += pd.DateOffset(months=test_months)
+        fold += 1
+
+    if all_trades:
+        combined = pd.concat(all_trades, ignore_index=True)
+        mkt_lr   = log_returns[index]
+        print(f'\n--- Walk-Forward Results: {ticker} ---')
+        compute_performance(combined, mkt_lr, label=f'{ticker} Walk-Forward')
+        return combined
+    return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
+#  7. MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    print('\n' + '='*55)
+    print('  ALGORITHMIC TRADING STRATEGY — PART 2')
+    print(f'  Period: {START_DATE}  →  {END_DATE}')
+    print(f'  Stocks: {TICKERS}    Index: {INDEX}')
+    print('='*55 + '\n')
+
+    # ── Download data ──
+    print('Downloading data (this takes ~1 min due to API rate limits)...\n')
+    prices, log_returns = download_and_prepare(
+        TICKERS, INDEX, START_DATE, END_DATE, csv_path='trading_data.csv'
+    )
+    print(f'\nPrices shape: {prices.shape}')
+    print(prices.tail())
+
+    mkt_lr = log_returns[INDEX]
+
+    # ── Full-sample backtest for each ticker ──
+    all_full_trades = []
+    for ticker in TICKERS:
+        print(f'\n--- Full-Sample Backtest: {ticker} ---')
+        trades = run_strategy(prices, log_returns, ticker)
+        if not trades.empty:
+            compute_performance(trades, mkt_lr, label=ticker)
+            all_full_trades.append(trades)
+
+    # ── Combined portfolio view ──
+    if all_full_trades:
+        combined_all = pd.concat(all_full_trades, ignore_index=True)
+        compute_performance(combined_all, mkt_lr, label='Combined Portfolio')
+
+    # ── Walk-forward backtest ──
+    print('\n\n' + '='*55)
+    print('  WALK-FORWARD BACKTESTING')
+    print('='*55)
+    for ticker in TICKERS:
+        print(f'\n>>> Walk-forward: {ticker}')
+        walk_forward_backtest(prices, log_returns, ticker, INDEX)
+
+    # ── Equity curve plot ──
+    if all_full_trades:
+        plt.figure(figsize=(12, 5))
+        for ticker, df in zip(TICKERS, all_full_trades):
+            df_sorted = df.sort_values('date')
+            cum = np.exp(df_sorted['log_return'].cumsum()) - 1
+            plt.plot(pd.to_datetime(df_sorted['date']), cum, label=ticker)
+        plt.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        plt.title('Cumulative Strategy Returns by Ticker')
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Log-Return')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('equity_curve.png', dpi=150)
+        plt.show()
+        print('\nEquity curve saved to equity_curve.png')
+
+
+if __name__ == '__main__':
+    main()
