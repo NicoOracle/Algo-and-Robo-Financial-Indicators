@@ -10,7 +10,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION  (hard-coded as required)
+#  CONFIGURATION  
 # ─────────────────────────────────────────────
 START_DATE  = '2022-01-01'
 END_DATE    = '2024-12-31'
