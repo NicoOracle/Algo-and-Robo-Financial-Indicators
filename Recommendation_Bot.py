@@ -70,7 +70,7 @@ from indicators import (
 # =============================================================================
 
 API_KEY    = 'ZKMMTO1ATDBLXH2K'
-TICKERS    = ['NVDA', 'MSFT', 'JPM']
+TICKERS    = ['NVDA', 'MSFT', 'JPM', 'META']
 INDEX      = 'SPY'
 START_DATE = '2022-01-01'
 END_DATE   = '2024-12-31'
@@ -138,11 +138,14 @@ def download_all_data(tickers, index, start_date, end_date, api_key):
         else:
             print('  ' + ticker + ': downloading from AlphaVantage...')
             records = _download_prices(ticker, start_date, end_date, api_key)
-            with open(csv_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['ticker', 'date', 'adjusted_close', 'log_return'])
-                writer.writerows(records)
-            print('    Saved ' + str(len(records)) + ' rows to ' + csv_file)
+            if records:
+                with open(csv_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['ticker', 'date', 'adjusted_close', 'log_return'])
+                    writer.writerows(records)
+                print('    Saved ' + str(len(records)) + ' rows to ' + csv_file)
+            else:
+                print('  *** ' + ticker + ': API returned no data — will retry next run ***')
             time.sleep(15)  # AlphaVantage free tier: 5 req/min
         all_data[ticker] = records
     return all_data
@@ -222,18 +225,25 @@ def execute_trade(recommendation, log_return_next_day):
     return None, None
 
 
-def execute_trades(data_dict, tickers, index_ticker='SPY'):
+def execute_trades(data_dict, tickers, index_ticker='SPY', long_only=True,
+                   force_close_at_end=False):
     """Run the full indicator pipeline on each trading day for each ticker.
 
-    Opens a position when the recommendation turns non-zero.
-    Closes (and optionally reverses) when the direction changes or goes flat.
-    Stores one log-return per closed trade.
+    Opens a long position on bullish signals; closes on bearish signals.
+    When long_only=True (default), bearish signals exit existing longs but
+    do NOT open short positions.  Equity stocks have an upward bias and
+    lagging momentum indicators mis-time short entries during bull markets,
+    producing net-negative short returns — long-only avoids this drag.
 
     Parameters
     ----------
-    data_dict    : dict  {ticker: [[ticker, date, price, log_return], ...]}
-    tickers      : list[str]  tickers to trade
-    index_ticker : str        benchmark ticker for market returns
+    data_dict         : dict  {ticker: [[ticker, date, price, log_return], ...]}
+    tickers           : list[str]  tickers to trade
+    index_ticker      : str        benchmark ticker for market returns
+    long_only         : bool       if True, never open short positions (default True)
+    force_close_at_end: bool       if True, close any open position at the last bar.
+                                   Use True in walk-forward folds so that capital
+                                   deployed within the window is fully accounted for.
 
     Returns
     -------
@@ -270,10 +280,11 @@ def execute_trades(data_dict, tickers, index_ticker='SPY'):
                   else -1 if rec in ('strong_sell', 'sell')
                   else 0)
 
-            # Close only on active signal reversal.
-            # PE=0 (chaotic regime) blocks NEW entries but does not force-close
-            # an existing position — premature exits during noisy consolidation
-            # would cut profitable trends short.
+            # In long_only mode a bearish signal (-1) closes an existing long
+            # but is treated as flat (0) for entry purposes — never open short.
+            entry_signal = desired if not long_only else max(desired, 0)
+
+            # Close on active reversal: bearish signal closes long, bullish closes short.
             if position != 0 and desired == -position:
                 log_ret = math.log(prices[i] / entry_price)
                 if position == -1:
@@ -285,11 +296,23 @@ def execute_trades(data_dict, tickers, index_ticker='SPY'):
                 position    = 0
                 entry_price = None
 
-            # Open new position
-            if position == 0 and desired != 0:
-                position    = desired
+            # Open new position (long_only: only enter on bullish signal)
+            if position == 0 and entry_signal != 0:
+                position    = entry_signal
                 entry_price = prices[i]
                 entry_date  = dates[i]
+
+        # Force-close any open position at the last bar in the window.
+        # Required in walk-forward folds so that capital deployed within the
+        # test period is fully accounted for rather than silently discarded.
+        if force_close_at_end and position != 0 and entry_price is not None:
+            log_ret = math.log(prices[-1] / entry_price)
+            if position == -1:
+                log_ret = -log_ret
+            trade_log_returns.append(log_ret)
+            direction = 'long' if position == 1 else 'short'
+            trade_dates.append((entry_date, dates[-1], ticker, direction))
+            market_returns_at_trades.append(spy_ret.get(dates[-1], 0.0))
 
     return trade_log_returns, trade_dates, market_returns_at_trades
 
@@ -465,7 +488,8 @@ def walk_forward_backtest(data_dict, tickers, index_ticker='SPY',
     all_oos = []
     for k, (ts, te) in enumerate(folds):
         fold_data = {t: data_dict[t][ts:te] for t in tickers + [index_ticker]}
-        tr, td, mr = execute_trades(fold_data, tickers, index_ticker)
+        tr, td, mr = execute_trades(fold_data, tickers, index_ticker,
+                                    force_close_at_end=True)
         if not tr:
             print('   ' + str(k + 1) + '   (no trades in this fold)')
             continue
@@ -515,9 +539,16 @@ def main():
     # ---- Download / load data -----------------------------------------------
     print('Loading data...')
     data = download_all_data(TICKERS, INDEX, START_DATE, END_DATE, API_KEY)
+    missing = [t for t in TICKERS + [INDEX] if not data.get(t)]
     for ticker, records in data.items():
-        print('  ' + ticker + ': ' + str(len(records)) + ' records  (' +
-              records[0][1] + ' to ' + records[-1][1] + ')')
+        if records:
+            print('  ' + ticker + ': ' + str(len(records)) + ' records  (' +
+                  records[0][1] + ' to ' + records[-1][1] + ')')
+        else:
+            print('  *** ' + ticker + ': NO DATA — re-run to retry download ***')
+    if missing:
+        print('\nSkipping backtest — missing data for: ' + str(missing))
+        return
 
     # ---- Compute SPY annualised return as benchmark -------------------------
     spy_records = data[INDEX]
