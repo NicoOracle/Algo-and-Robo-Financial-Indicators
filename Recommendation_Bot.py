@@ -482,10 +482,8 @@ def walk_forward_backtest(data_dict, tickers, index_ticker='SPY',
         print('  OOS avg return : ' + str(round(float(np.mean(r_all)), 6)) +
               '   t=' + str(round(float(t), 3)) +
               '   p=' + str(round(float(p), 4)))
-        print('=' * 60)
-        return all_oos
     print('=' * 60)
-    return []
+    return all_oos if all_oos else []
 
 
 # =============================================================================
