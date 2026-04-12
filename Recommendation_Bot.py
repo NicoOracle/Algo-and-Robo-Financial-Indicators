@@ -70,7 +70,7 @@ from indicators import (
 # =============================================================================
 
 API_KEY    = 'ZKMMTO1ATDBLXH2K'
-TICKERS    = ['NVDA', 'MSFT', 'JPM', 'META']
+TICKERS    = ['NVDA', 'JPM', 'META']
 INDEX      = 'SPY'
 START_DATE = '2022-01-01'
 END_DATE   = '2024-12-31'
