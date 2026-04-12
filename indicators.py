@@ -54,12 +54,12 @@ def _permutation_entropy_score(prices, m=3, normalize=True):
     return entropy
 
 
-def indicator_1_pe(prices_series, date_idx, window=30, m=3, threshold=0.75):
+def indicator_1_pe(prices_series, date_idx, window=30, m=3, threshold=0.85):
     """Permutation Entropy regime filter.
 
     Returns 1 (orderly: PE < threshold) — proceed with directional signals.
     Returns 0 (chaotic: PE >= threshold) — step aside.
-    threshold=0.75 allows trading during moderately trending conditions.
+    threshold=0.85 allows trading during moderately trending conditions (~50% of days).
     """
     if date_idx < window + m - 1:
         return 0

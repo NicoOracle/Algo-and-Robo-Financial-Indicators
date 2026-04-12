@@ -59,6 +59,7 @@ warnings.filterwarnings('ignore')
 from indicators import (
     indicator_1_pe,
     indicator_2_macd,
+    indicator_3_rsi,
     indicator_5_fibonacci,
     indicator_4_ma_crossover,
 )
@@ -69,7 +70,7 @@ from indicators import (
 # =============================================================================
 
 API_KEY    = 'ZKMMTO1ATDBLXH2K'
-TICKERS    = ['AAPL', 'MSFT', 'JPM']
+TICKERS    = ['NVDA', 'MSFT', 'JPM']
 INDEX      = 'SPY'
 START_DATE = '2022-01-01'
 END_DATE   = '2024-12-31'
@@ -158,19 +159,20 @@ def download_all_data(tickers, index, start_date, end_date, api_key):
 #  SECTION 3 — RECOMMENDATION  (README item 7)
 # =============================================================================
 
-def get_recommendation(pe_sig, macd_sig, fib_sig, ma_sig):
-    """Combine the four indicator signals into a 5-level recommendation.
+def get_recommendation(pe_sig, macd_sig, fib_sig, ma_sig, rsi_sig=0):
+    """Combine indicator signals into a 5-level recommendation.
 
     Decision tree
     -------------
     PE = 0  → 'hold'  (chaotic regime — all other signals ignored)
-    PE = 1  → majority vote on {MACD, Fibonacci, MA Crossover}:
-        bullish  bearish  recommendation
-        3        0        strong_buy
-        2        ≤1       buy
-        0        3        strong_sell
-        ≤1       2        sell
-        else              hold
+    PE = 1  → majority vote on {MACD, Fibonacci, MA Crossover, RSI}:
+        bullish  recommendation
+        ≥ 3      strong_buy / strong_sell
+        2        buy / sell
+        else     hold
+
+    RSI (momentum mode, threshold=50) fires earlier in a trend than the
+    slower MA crossover, allowing entry before the full MA lag resolves.
 
     Parameters
     ----------
@@ -178,6 +180,7 @@ def get_recommendation(pe_sig, macd_sig, fib_sig, ma_sig):
     macd_sig : int  -1, 0, 1  (MACD above / below signal line)
     fib_sig  : int  -1, 0, 1  (Fibonacci level proximity)
     ma_sig   : int  -1, 0, 1  (MA crossover direction)
+    rsi_sig  : int  -1, 0, 1  (RSI above / below 50)
 
     Returns
     -------
@@ -186,12 +189,12 @@ def get_recommendation(pe_sig, macd_sig, fib_sig, ma_sig):
     if pe_sig == 0:
         return 'hold'
 
-    bullish = sum(1 for s in [macd_sig, fib_sig, ma_sig] if s ==  1)
-    bearish = sum(1 for s in [macd_sig, fib_sig, ma_sig] if s == -1)
+    bullish = sum(1 for s in [macd_sig, fib_sig, ma_sig, rsi_sig] if s ==  1)
+    bearish = sum(1 for s in [macd_sig, fib_sig, ma_sig, rsi_sig] if s == -1)
 
-    if   bullish == 3: return 'strong_buy'
+    if   bullish >= 3: return 'strong_buy'
     elif bullish == 2: return 'buy'
-    elif bearish == 3: return 'strong_sell'
+    elif bearish >= 3: return 'strong_sell'
     elif bearish == 2: return 'sell'
     return 'hold'
 
@@ -258,16 +261,20 @@ def execute_trades(data_dict, tickers, index_ticker='SPY'):
         for i in range(WARMUP, len(prices)):
             pe  = indicator_1_pe(prices, i)
             mac = indicator_2_macd(prices, i)
-            fib = indicator_5_fibonacci(prices, i)
+            fib = indicator_5_fibonacci(prices, i, proximity_pct=0.02)
             ma  = indicator_4_ma_crossover(prices, i)
-            rec = get_recommendation(pe, mac, fib, ma)
+            rsi = indicator_3_rsi(prices, i)
+            rec = get_recommendation(pe, mac, fib, ma, rsi)
 
             desired = (1  if rec in ('strong_buy',  'buy')
                   else -1 if rec in ('strong_sell', 'sell')
                   else 0)
 
-            # Close existing position when direction reverses or signal goes flat
-            if position != 0 and desired != position:
+            # Close only on active signal reversal.
+            # PE=0 (chaotic regime) blocks NEW entries but does not force-close
+            # an existing position — premature exits during noisy consolidation
+            # would cut profitable trends short.
+            if position != 0 and desired == -position:
                 log_ret = math.log(prices[i] / entry_price)
                 if position == -1:
                     log_ret = -log_ret
@@ -293,7 +300,8 @@ def execute_trades(data_dict, tickers, index_ticker='SPY'):
 # =============================================================================
 
 def compute_performance(trade_log_returns, trade_dates, market_returns_at_trades,
-                        rf_annual=RISK_FREE, label='Strategy'):
+                        rf_annual=RISK_FREE, label='Strategy',
+                        benchmark_ann_return=None):
     """Compute and print all required performance metrics.
 
     Parameters
@@ -392,6 +400,11 @@ def compute_performance(trade_log_returns, trade_dates, market_returns_at_trades
     print('')
     print('e. Cumulative Return   : ' + str(round(cum_ret * 100, 2)) + '%')
     print('   Annualised Return   : ' + str(round(ann_ret * 100, 2)) + '%')
+    if benchmark_ann_return is not None:
+        diff = ann_ret - benchmark_ann_return
+        sign = '+' if diff >= 0 else ''
+        print('   SPY Annualised      : ' + str(round(benchmark_ann_return * 100, 2)) + '%')
+        print('   Alpha vs SPY        : ' + sign + str(round(diff * 100, 2)) + '%')
     print('')
     print('f. Sharpe Ratio        : ' + str(round(sharpe,  4)))
     print('')
@@ -506,20 +519,31 @@ def main():
         print('  ' + ticker + ': ' + str(len(records)) + ' records  (' +
               records[0][1] + ' to ' + records[-1][1] + ')')
 
+    # ---- Compute SPY annualised return as benchmark -------------------------
+    spy_records = data[INDEX]
+    spy_prices  = [r[2] for r in spy_records]
+    spy_cum     = math.log(spy_prices[-1] / spy_prices[0])
+    spy_d0      = datetime.strptime(spy_records[0][1],  '%Y-%m-%d')
+    spy_d1      = datetime.strptime(spy_records[-1][1], '%Y-%m-%d')
+    spy_years   = max((spy_d1 - spy_d0).days / 365.25, 1e-6)
+    spy_ann     = spy_cum / spy_years
+
     # ---- Full-sample backtest ------------------------------------------------
     print('\n' + '─' * 60)
     print('  FULL-SAMPLE BACKTEST  —  ' + str(TICKERS))
     print('─' * 60)
     trade_returns, trade_info, mkt_rets = execute_trades(data, TICKERS, INDEX)
     compute_performance(trade_returns, trade_info, mkt_rets,
-                        label='All Tickers Combined')
+                        label='All Tickers Combined',
+                        benchmark_ann_return=spy_ann)
 
     # ---- Per-ticker breakdown ------------------------------------------------
     for ticker in TICKERS:
         tr, td, mr = execute_trades({ticker: data[ticker], INDEX: data[INDEX]},
                                     [ticker], INDEX)
         if tr:
-            compute_performance(tr, td, mr, label=ticker)
+            compute_performance(tr, td, mr, label=ticker,
+                                benchmark_ann_return=spy_ann)
         else:
             print('  [' + ticker + ']  No trades generated.')
 
