@@ -1,3 +1,7 @@
+## To use: run Recommendation_Bot.ipynb
+
+Assignment Instructions:
+
 # Algo-and-Robo-Financial-Indicators
 
 1. Use the AlphaVantage API to obtain the data. Use any data from 01-01-2022 onwards.
